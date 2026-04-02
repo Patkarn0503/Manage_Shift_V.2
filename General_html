@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: Arial, sans-serif; padding: 12px; }
+    .row { margin-bottom: 10px; }
+    label { display:block; font-weight:600; margin-bottom:6px; }
+    select, button { width: 100%; padding: 8px; }
+    .two { display:flex; gap:10px; }
+    .two > div { flex:1; }
+    .box { border:1px solid #ddd; padding:10px; border-radius:8px; }
+    #deptList { height: 260px; }
+    .hint { color:#666; font-size:12px; margin-top:4px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div class="row two">
+      <div>
+        <label>Rule Sheet (กติกา)</label>
+        <select id="ruleSheet"></select>
+        <div class="hint">ต้องมีหัวคอลัมน์: Department, Must_Pair, Must_Not_Pair, Weekday_*, Weekend_*, Weekday_ME, Weekend_ME, Ideal_shift (+Fix_shift, Priority ได้)</div>
+      </div>
+      <div>
+        <label>Result Sheet (ตารางลงเวร)</label>
+        <select id="resultSheet"></select>
+        <div class="hint">หัวตารางต้องมี DAY/วัน + M1..Mx E1..Ex N1..Nx</div>
+      </div>
+    </div>
+
+    <div class="row two">
+      <div>
+        <label>Calendar Mode</label>
+        <select id="calendarMode">
+          <option value="BY_COLOR" selected>BY_COLOR (ดูสีคอลัมน์ A)</option>
+          <option value="BY_DATE">BY_DATE (ใช้ Result!J1 + Holiday)</option>
+        </select>
+      </div>
+      <div>
+        <label>Scoring Policy</label>
+        <select id="scoringPolicy">
+          <option value="DESIRE">DESIRE</option>
+          <option value="DESIRE_ME">DESIRE_ME</option>
+          <option value="DESIRE_ME_QUOTA">DESIRE_ME_QUOTA</option>
+          <option value="DESIRE_ME_QUOTA_PRIORITY" selected>DESIRE_ME_QUOTA_PRIORITY</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>เลือก Department/รายชื่อ (จาก Rule Sheet)</label>
+      <select id="deptList" multiple></select>
+      <div class="hint">กด Ctrl/Shift เพื่อเลือกหลายรายการ</div>
+    </div>
+
+    <div class="row">
+      <label>
+        <input type="checkbox" id="autoPair" checked>
+        เปิด AutoPair (Must_Pair / EMP แบบ atomic)
+      </label>
+    </div>
+
+    <div class="row">
+      <button onclick="run()">▶ Run Scheduler</button>
+    </div>
+
+    <div class="row">
+      <div id="status" class="hint"></div>
+    </div>
+  </div>
+
+<script>
+  function setStatus(msg){
+    document.getElementById('status').textContent = msg || '';
+  }
+
+  function loadSheets() {
+    setStatus('กำลังโหลดรายชื่อชีท...');
+    google.script.run
+      .withSuccessHandler(function(names){
+        const ruleSel = document.getElementById('ruleSheet');
+        const resSel  = document.getElementById('resultSheet');
+
+        ruleSel.innerHTML = '';
+        resSel.innerHTML  = '';
+
+        names.forEach(n => {
+          const o1 = document.createElement('option');
+          o1.value = n;
+          o1.textContent = n;
+          ruleSel.appendChild(o1);
+
+          const o2 = document.createElement('option');
+          o2.value = n;
+          o2.textContent = n;
+          resSel.appendChild(o2);
+        });
+
+        if (names.includes('OUT_D')) {
+          ruleSel.value = 'OUT_D';
+        } else if (names.includes('IN_D')) {
+          ruleSel.value = 'IN_D';
+        }
+
+        if (names.includes('Result')) {
+          resSel.value = 'Result';
+        } else if (names.includes('Result_IN')) {
+          resSel.value = 'Result_IN';
+        }
+
+        loadDeptList();
+        ruleSel.addEventListener('change', loadDeptList);
+
+        setStatus('');
+      })
+      .withFailureHandler(function(err){
+        setStatus('โหลดรายชื่อชีทไม่สำเร็จ: ' + (err && err.message ? err.message : err));
+      })
+      .CORE_getSheetNamesForDialog();
+  }
+
+  function loadDeptList() {
+    const ruleSheetName = document.getElementById('ruleSheet').value;
+    setStatus('กำลังโหลดรายชื่อจาก ' + ruleSheetName + ' ...');
+
+    google.script.run
+      .withSuccessHandler(function(depts){
+        const sel = document.getElementById('deptList');
+        sel.innerHTML = '';
+
+        depts.forEach(d => {
+          const opt = document.createElement('option');
+          opt.value = d;
+          opt.textContent = d;
+          opt.selected = true;
+          sel.appendChild(opt);
+        });
+
+        setStatus('');
+      })
+      .withFailureHandler(function(err){
+        setStatus('โหลดรายชื่อไม่สำเร็จ: ' + (err && err.message ? err.message : err));
+      })
+      .CORE_getDeptListForDialog(ruleSheetName);
+  }
+
+  function getSelectedMulti(selectEl) {
+    const out = [];
+    for (const opt of selectEl.options) {
+      if (opt.selected) out.push(opt.value);
+    }
+    return out;
+  }
+
+  function run() {
+    const ruleSheetName = document.getElementById('ruleSheet').value;
+    const resultSheetName = document.getElementById('resultSheet').value;
+    const calendarMode = document.getElementById('calendarMode').value;
+    const scoringPolicy = document.getElementById('scoringPolicy').value;
+    const autoPair = document.getElementById('autoPair').checked;
+    const deptList = getSelectedMulti(document.getElementById('deptList'));
+
+    if (!deptList.length) {
+      setStatus('กรุณาเลือกอย่างน้อย 1 รายการ');
+      return;
+    }
+
+    setStatus('กำลังรัน...');
+
+    google.script.run
+      .withSuccessHandler(function(res){
+        setStatus((res && res.message) ? res.message : 'เสร็จแล้ว');
+      })
+      .withFailureHandler(function(err){
+        console.error(err);
+        setStatus('รันไม่สำเร็จ: ' + (err && err.message ? err.message : err));
+      })
+      .CORE_runSchedulerFromDialog({
+        ruleSheetName,
+        resultSheetName,
+        calendarMode,
+        scoringPolicy,
+        autoPair,
+        deptList
+      });
+  }
+
+  loadSheets();
+</script>
+</body>
+</html>
