@@ -1,0 +1,1049 @@
+/************************************************************
+ * SHIFT SCHEDULER (CORE / MRV_SLOT_FIRST) - DYNAMIC+SELECT SHEETS
+ * - Menu + Dialog
+ * - Result header-driven: DAY + (M1..Mx, E1..Ex, N1..Nx) any order
+ * - Rule sheet header-driven (Department, Must_Pair, Must_Not_Pair, ...)
+ * - Quota per-dept: Fix_shift > 0 => Fix else Ideal_shift
+ * - MRV: choose hardest slot (fewest candidates), fill best score
+ * - 3 Pass: WEEKDAY -> WEEKEND -> WN_B4_WD -> FINAL_ANYTYPE
+ * - EMP in Must_Not_Pair = “ห้ามอยู่เดี่ยว” (ต้องมีคู่ในกะเดียวกัน)
+ * - mustPair robust: ถ้ากะนั้นยังมีช่องว่าง และมี mustPair => ต้องมี partner feasible อย่างน้อย 1
+ *
+ * PATCH:
+ * 1) ไม่จัดลงแถวที่คอลัมน์แรก (A) เป็น Text
+ * 2) กัน recursion ซ้อนตอนเช็ก partner feasibility
+ * 3) ใส่ guard กัน loop ยาวผิดปกติ
+ ************************************************************/
+
+/***********************
+ * CONFIG
+ ***********************/
+const CORE_SHEET_RESULT  = "Result";
+const CORE_SHEET_HOLIDAY = "Holiday";
+const CORE_SHEET_LOG     = "Log";
+const CORE_SHEET_RULE    = "OUT_D";
+
+/***********************
+ * MENU
+ ***********************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Operation")
+  /*  .addItem("ลงเวรจากคอลัมน์ B", "runSchedule_DemandOnly")
+    .addItem("B) เติม OUT ต่อจาก Result", "runFill_OUT_AfterDemand")
+    .addItem("C) ลงเวรคู่ OUT (WM/WW)", "runFill_WW_WM_PairOut")
+    .addItem("D) เติม PRI / OTH", "runStepD_Fill_PRI_OTH_3Pass")
+    .addItem("E) เติม OPD", "runStepE1_Fill_OPD_Only_3Pass")
+    .addItem("F) เติม ICU ER WW WM", "runStepE2_Fill_ICU_ER_WW_WM_3Pass")
+    .addSeparator()
+    .addItem("▶ รันทั้งหมด A–F (อัตโนมัติ)", "runSchedule_All_A_to_F")
+    .addSeparator()*/
+    .addItem("รันตัวจัดเวร (โครงกลาง)", "openSchedulerDialog_Dynamic")
+    .addSeparator()
+    .addItem("สร้างตารางปฏิทิน", "runSchedule_DemandOnly_IN")
+    .addItem("ล้าง Log", "clearLog")
+    .addToUi();
+}
+
+/***********************
+ * DIALOG
+ ***********************/
+function openSchedulerDialog_Dynamic() {
+  const html = HtmlService.createHtmlOutputFromFile("SchedulerDialog")
+    .setTitle("รันตัวจัดเวร (Dynamic)")
+    .setWidth(560)
+    .setHeight(760);
+
+  SpreadsheetApp.getUi().showModalDialog(html, "รันตัวจัดเวร (Dynamic)");
+}
+
+/***********************
+ * API for Dialog
+ ***********************/
+function CORE_getSheetNamesForDialog() {
+  const ss = SpreadsheetApp.getActive();
+  return ss.getSheets().map(s => s.getName());
+}
+
+function CORE_getDeptListForDialog(ruleSheetName) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(ruleSheetName);
+  if (!sh) throw new Error('ไม่พบชีท "' + ruleSheetName + '"');
+  return CORE_getDeptList_FromRuleSheet_(sh);
+}
+
+function CORE_runSchedulerFromDialog(config) {
+  return CORE_runScheduler_(config);
+}
+
+/***********************
+ * CLEAR LOG
+ ***********************/
+function clearLog() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CORE_SHEET_LOG);
+  if (sh) sh.clear();
+}
+
+/************************************************************
+ * MAIN: RUN SCHEDULER (MRV_SLOT_FIRST, STOP WHEN QUOTA DONE)
+ * config:
+ * - ruleSheetName:  string
+ * - resultSheetName:string
+ * - calendarMode: "BY_COLOR" | "BY_DATE"
+ * - scoringPolicy:"DESIRE" | "DESIRE_ME" | "DESIRE_ME_QUOTA" | "DESIRE_ME_QUOTA_PRIORITY"
+ * - deptList:     array of departments
+ * - autoPair:     boolean
+ ************************************************************/
+function CORE_runScheduler_(config) {
+  const ss = SpreadsheetApp.getActive();
+
+  const ruleSheetName   = String((config && config.ruleSheetName) || "").trim();
+  const resultSheetName = String((config && config.resultSheetName) || "").trim();
+  if (!ruleSheetName)   return { ok:false, message:"ไม่ได้ระบุชื่อชีทกติกา (Rule Sheet)" };
+  if (!resultSheetName) return { ok:false, message:"ไม่ได้ระบุชื่อชีทผลลัพธ์ (Result Sheet)" };
+
+  const calendarMode  = String((config && config.calendarMode) || "BY_COLOR").toUpperCase();
+  const scoringPolicy = String((config && config.scoringPolicy) || "DESIRE_ME_QUOTA_PRIORITY").toUpperCase();
+  const autoPair      = !!(config && config.autoPair);
+
+  let deptList = (config && config.deptList) ? config.deptList : [];
+  deptList = deptList.map(CORE_norm_).filter(Boolean);
+
+  if (!deptList.length) {
+    return { ok:false, message:"ไม่ได้เลือกแผนก/รายชื่อ (deptList ว่าง)" };
+  }
+
+  const ruleSh   = ss.getSheetByName(ruleSheetName);
+  const resultSh = ss.getSheetByName(resultSheetName);
+  const holSh    = ss.getSheetByName(CORE_SHEET_HOLIDAY);
+
+  if (!ruleSh)   throw new Error('ไม่พบชีท "' + ruleSheetName + '"');
+  if (!resultSh) throw new Error('ไม่พบชีท "' + resultSheetName + '"');
+
+  const rules = CORE_readRulesFromRuleSheet_(ruleSh);
+
+  deptList.forEach(d => {
+    if (!rules[d]) throw new Error('ไม่พบกติกาของ "' + d + '" ในชีท ' + ruleSheetName);
+  });
+
+  /**************
+   * Load Result
+   **************/
+  const lastRow = Math.max(1, resultSh.getLastRow());
+  const lastCol = Math.max(1, resultSh.getLastColumn());
+  if (lastRow < 2) return { ok:true, message:"Result ไม่มีข้อมูลให้จัด (ต้องมีแถววันอย่างน้อย 1 แถว)" };
+
+  const headerRow = resultSh.getRange(1, 1, 1, lastCol).getValues()[0];
+  const colMap = CORE_getResultColMap_Flex_(headerRow);
+
+  const width = colMap.maxColIndex + 1;
+  const range = resultSh.getRange(1, 1, lastRow, width);
+  const data  = range.getValues();
+
+  const colA_bg = resultSh.getRange(1, 1, lastRow, 1).getBackgrounds();
+
+  if (data.length < 2) {
+    return { ok:true, message:"Result ไม่มีข้อมูลให้จัด (ต้องมีแถววันอย่างน้อย 1 แถว)" };
+  }
+
+  /**************
+   * Calendar / SlotType
+   **************/
+  let slotTypeByRow = [];
+  if (calendarMode === "BY_DATE") {
+    const monthCell = resultSh.getRange("J1").getValue();
+    if (!(monthCell instanceof Date)) {
+      throw new Error('calendarMode=BY_DATE ต้องให้ ' + resultSheetName + '!J1 เป็นวันที่ของเดือน (เช่น 2026-01-01)');
+    }
+    const holidaySet = holSh ? CORE_loadHolidaySet_(holSh) : new Set();
+    slotTypeByRow = CORE_buildSlotTypeByDate_(data, monthCell, holidaySet, colMap.dayCol);
+  } else {
+    const weekendColor = CORE_detectWeekendColorFromColA_(colA_bg);
+    slotTypeByRow = CORE_buildSlotTypeByColor_(colA_bg, weekendColor);
+  }
+
+  /**************
+   * Build timeline
+   **************/
+  const timeline = [];
+  const tIndexMap = {};
+
+  for (let r = 1; r < data.length; r++) {
+    if (CORE_isTextInColA_(data[r][0])) continue;
+
+    const dayVal = data[r][colMap.dayCol];
+    if (dayVal === "" || dayVal == null) continue;
+
+    const day = dayVal;
+    ["M","E","N"].forEach(sh => {
+      const cols = colMap.shiftCols[sh];
+      const t = { r, day, shift: sh, cols, rowType: slotTypeByRow[r] || "WEEKDAY" };
+      const idx = timeline.length;
+      timeline.push(t);
+      tIndexMap[r + "|" + sh] = idx;
+    });
+  }
+
+  if (!timeline.length) {
+    return { ok:true, message:"ไม่พบแถววันใน Result (หรือถูกข้ามทั้งหมดเพราะคอลัมน์ A เป็นข้อความ)" };
+  }
+
+  /**************
+   * used / remaining
+   **************/
+  const used = {};
+  deptList.forEach(d => used[d] = 0);
+
+  const slotCols = [].concat(colMap.shiftCols.M, colMap.shiftCols.E, colMap.shiftCols.N);
+  for (let r = 1; r < data.length; r++) {
+    if (CORE_isTextInColA_(data[r][0])) continue;
+
+    for (const c of slotCols) {
+      const d = CORE_norm_(data[r][c]);
+      if (used[d] != null) used[d]++;
+    }
+  }
+
+  const remaining = {};
+  deptList.forEach(d => {
+    const fix   = Number(rules[d].fixShift || 0);
+    const ideal = Number(rules[d].ideal || 0);
+    const q = fix > 0 ? fix : ideal;
+    remaining[d] = Math.max(0, q - Number(used[d] || 0));
+  });
+
+  /**************
+   * Config weights
+   **************/
+  const CFG = {
+    W_DESIRE: 100,
+    W_ME_BONUS: 60,
+    W_QUOTA: 40,
+    W_PRIORITY: 12
+  };
+
+  /**************
+   * Log
+   **************/
+  const log = [];
+  log.push(["ts","step","pass","day","shift","cell","dept","action","reason","score"]);
+
+  /**************
+   * Passes
+   **************/
+  const passes = [
+    { name: "PASS1_WEEKDAY",      accept: (rowType) => rowType === "WEEKDAY" },
+    { name: "PASS2_WEEKEND",      accept: (rowType) => rowType === "WEEKEND" },
+    { name: "PASS3_WN_BEFORE_WD", accept: (rowType) => rowType === "WN_B4_WD" }
+  ];
+
+  let filledTotal = 0;
+
+  const baseCtx = {
+    data, timeline, tIndexMap, deptList, rules, remaining,
+    scoringPolicy, CFG, autoPair, log, colMap
+  };
+
+  for (const p of passes) {
+    const filled = CORE_runMRVPass_(p.name, p.accept, baseCtx);
+    filledTotal += filled;
+    if (CORE_allQuotaDone_(remaining, deptList)) break;
+  }
+
+  if (!CORE_allQuotaDone_(remaining, deptList)) {
+    const filledX = CORE_runMRVPass_("FINAL_MRV_ANYTYPE", (_rowType) => true, baseCtx);
+    filledTotal += filledX;
+  }
+
+  range.setValues(data);
+  CORE_writeLog_(ss, CORE_SHEET_LOG, log);
+
+  const remainLines = deptList.map(d => `${d}=${remaining[d]}`).join(", ");
+
+  const msg =
+    `โครงกลาง (MRV_SLOT_FIRST) เสร็จ\n` +
+    `- ruleSheet=${ruleSheetName}, resultSheet=${resultSheetName}\n` +
+    `- policy=${scoringPolicy}, calendarMode=${calendarMode}, autoPair=${autoPair}\n` +
+    `- เติมเพิ่มทั้งหมด: ${filledTotal}\n` +
+    `- โควต้าคงเหลือ: ${remainLines}\n` +
+    (CORE_allQuotaDone_(remaining, deptList)
+      ? `- สถานะ: โควต้าครบทุกแผนก`
+      : `- สถานะ: ยังมีโควต้าค้าง (ดู Log เพื่อหาสาเหตุว่าช่องไหนไม่มี candidate)`);
+
+  return { ok:true, message: msg };
+}
+
+/***********************
+ * MRV PASS
+ ***********************/
+function CORE_runMRVPass_(passName, acceptTypeFn, ctx) {
+  const {
+    data, timeline, tIndexMap, deptList, rules, remaining,
+    autoPair, log, colMap
+  } = ctx;
+
+  let filled = 0;
+  let guard = 0;
+
+  while (!CORE_allQuotaDone_(remaining, deptList)) {
+    guard++;
+    if (guard > 5000) {
+      log.push([
+        CORE_now_(),"CORE",passName,"","","","","STOP",
+        "guard exceeded: ลูปเกิน 5000 รอบ จึงหยุดเพื่อป้องกันค้าง",""
+      ]);
+      break;
+    }
+
+    const emptySlots = CORE_collectEmptySlots_(timeline, acceptTypeFn, data, colMap);
+    if (!emptySlots.length) break;
+
+    let bestSlot = null;
+    let bestCand = null;
+    let bestCount = Infinity;
+    let bestTopScore = -1;
+
+    for (const s of emptySlots) {
+      const cands = CORE_getCandidatesForSlot_(s, ctx);
+      const cnt = cands.length;
+      if (cnt <= 0) continue;
+
+      const top = cands[0];
+      if (cnt < bestCount || (cnt === bestCount && top.score > bestTopScore)) {
+        bestCount = cnt;
+        bestTopScore = top.score;
+        bestSlot = s;
+        bestCand = top;
+      }
+    }
+
+    if (!bestSlot || !bestCand) break;
+
+    CORE_placeDept_(bestSlot, bestCand.dept, data);
+    if (remaining[bestCand.dept] > 0) remaining[bestCand.dept]--;
+
+    filled++;
+    log.push([
+      CORE_now_(),"CORE",passName,bestSlot.day,bestSlot.shift,
+      CORE_cellA1_(bestSlot.r, bestSlot.c),
+      bestCand.dept,"FILL",bestCand.reason,String(bestCand.score)
+    ]);
+
+    if (autoPair) {
+      const t = timeline[bestSlot.tIndex];
+      const otherCol = CORE_pickEmptyPartnerCol_(t, bestSlot.c, data);
+      const otherVal = (otherCol != null) ? CORE_norm_(data[t.r][otherCol]) : "";
+
+      const rule = rules[CORE_norm_(bestCand.dept)];
+      const mp = (rule && rule.mustPair) ? rule.mustPair : [];
+      const hasEmpBan = !!(rule && rule.mustNotPair && rule.mustNotPair.indexOf("EMP") >= 0);
+
+      const otherIsEmpty = (otherCol != null) && !otherVal;
+      const mustBePairedNow = otherIsEmpty && (hasEmpBan || (mp && mp.length));
+
+      if (mustBePairedNow) {
+        const slot2 = CORE_makeSlot_(t.r, t.shift, otherCol, tIndexMap, data, colMap);
+        const bestPartner = CORE_pickBestPartnerForSlot_(slot2, mp, ctx);
+
+        if (bestPartner) {
+          CORE_placeDept_(slot2, bestPartner.dept, data);
+          if (remaining[bestPartner.dept] > 0) remaining[bestPartner.dept]--;
+          filled++;
+          log.push([
+            CORE_now_(),"CORE",passName,slot2.day,slot2.shift,
+            CORE_cellA1_(slot2.r, slot2.c),
+            bestPartner.dept,"FILL","autopair " + bestPartner.reason,String(bestPartner.score)
+          ]);
+        } else {
+          data[t.r][bestSlot.c] = "";
+          remaining[bestCand.dept] = (remaining[bestCand.dept] || 0) + 1;
+          filled--;
+          log.push([
+            CORE_now_(),"CORE",passName,bestSlot.day,bestSlot.shift,
+            CORE_cellA1_(bestSlot.r, bestSlot.c),
+            bestCand.dept,"NOFILL","atomic pair required but no partner available",""
+          ]);
+        }
+      } else {
+        if (otherIsEmpty && mp.length) {
+          const slot2 = CORE_makeSlot_(t.r, t.shift, otherCol, tIndexMap, data, colMap);
+          const bestPartner = CORE_pickBestPartnerForSlot_(slot2, mp, ctx);
+
+          if (bestPartner) {
+            CORE_placeDept_(slot2, bestPartner.dept, data);
+            if (remaining[bestPartner.dept] > 0) remaining[bestPartner.dept]--;
+            filled++;
+            log.push([
+              CORE_now_(),"CORE",passName,slot2.day,slot2.shift,
+              CORE_cellA1_(slot2.r, slot2.c),
+              bestPartner.dept,"FILL","autopair " + bestPartner.reason,String(bestPartner.score)
+            ]);
+          } else {
+            log.push([
+              CORE_now_(),"CORE",passName,bestSlot.day,bestSlot.shift,
+              CORE_cellA1_(t.r, otherCol),
+              bestCand.dept,"WARN","autoPair: หา partner ที่ผ่านเงื่อนไข/เหลือโควต้าไม่ได้",""
+            ]);
+          }
+        }
+      }
+    }
+  }
+
+  return filled;
+}
+
+/***********************
+ * CANDIDATES FOR SLOT
+ ***********************/
+function CORE_getCandidatesForSlot_(slot, ctx) {
+  const { deptList, remaining } = ctx;
+
+  const out = [];
+  for (const dept of deptList) {
+    if ((remaining[dept] || 0) <= 0) continue;
+
+    const check = CORE_checkCandidate_(slot, dept, ctx);
+    if (!check.ok) continue;
+
+    const scoreObj = CORE_scoreCandidate_(slot, dept, ctx);
+    out.push({ dept, score: scoreObj.score, reason: scoreObj.reason });
+  }
+
+  out.sort((a,b) => b.score - a.score);
+  return out;
+}
+
+/***********************
+ * HARD CHECK
+ ***********************/
+function CORE_checkCandidate_(slot, dept, ctx) {
+  const { data, timeline, rules } = ctx;
+
+  const d = CORE_norm_(dept);
+  const t = timeline[slot.tIndex];
+
+  const inThisShift = t.cols.map(c => CORE_norm_(data[t.r][c])).filter(Boolean);
+  if (inThisShift.indexOf(d) >= 0) return { ok:false, reason:"duplicate dept in same shift" };
+
+  const rule = rules[d];
+  if (!rule) return { ok:false, reason:"missing rule" };
+
+  const desire = CORE_getDesire_(rule, t.shift, t.rowType);
+  if (desire <= 0) return { ok:false, reason:"desire=0" };
+
+  const otherFilled = inThisShift;
+
+  if (rule.mustNotPair && rule.mustNotPair.length) {
+    const hasEmpBan = (rule.mustNotPair.indexOf("EMP") >= 0);
+
+    if (hasEmpBan) {
+      const wouldBeAlone = (otherFilled.length === 0);
+      if (wouldBeAlone) {
+        const okPartner = CORE_hasFeasiblePartnerForEmpMulti_(slot, d, ctx);
+        if (!okPartner) return { ok:false, reason:"EMP: require feasible partner but none available" };
+      }
+    }
+
+    for (const x of otherFilled) {
+      if (rule.mustNotPair.indexOf(x) >= 0) return { ok:false, reason:"hit must_not_pair " + x };
+    }
+  }
+
+  if (rule.mustPair && rule.mustPair.length) {
+    if (otherFilled.length > 0) {
+      for (const x of otherFilled) {
+        if (rule.mustPair.indexOf(x) < 0) {
+          return { ok:false, reason:"must_pair not satisfied (other=" + x + ")" };
+        }
+      }
+    } else {
+      const okPartner = CORE_hasFeasiblePartnerForEmpMulti_(slot, d, ctx);
+      if (!okPartner) return { ok:false, reason:"must_pair requires partner but none feasible" };
+    }
+  }
+
+  const cons = CORE_checkNoMoreThan2Consecutive_(timeline, data, slot.tIndex, d, slot.tIndex);
+  if (!cons.ok) return { ok:false, reason: cons.reason };
+
+  return { ok:true, reason:"ok" };
+}
+
+/***********************
+ * SHALLOW CHECK
+ * ใช้สำหรับเช็ก partner feasibility
+ * เพื่อไม่ให้ recursion ซ้อนกลับไปเช็ก mustPair/EMP อีก
+ ***********************/
+function CORE_checkCandidateShallow_(slot, dept, ctx) {
+  const { data, timeline, rules } = ctx;
+
+  const d = CORE_norm_(dept);
+  const t = timeline[slot.tIndex];
+
+  const inThisShift = t.cols.map(c => CORE_norm_(data[t.r][c])).filter(Boolean);
+  if (inThisShift.indexOf(d) >= 0) return { ok:false, reason:"duplicate dept in same shift" };
+
+  const rule = rules[d];
+  if (!rule) return { ok:false, reason:"missing rule" };
+
+  const desire = CORE_getDesire_(rule, t.shift, t.rowType);
+  if (desire <= 0) return { ok:false, reason:"desire=0" };
+
+  if (rule.mustNotPair && rule.mustNotPair.length) {
+    for (const x of inThisShift) {
+      if (x !== "EMP" && rule.mustNotPair.indexOf(x) >= 0) {
+        return { ok:false, reason:"hit must_not_pair " + x };
+      }
+    }
+  }
+
+  const cons = CORE_checkNoMoreThan2Consecutive_(timeline, data, slot.tIndex, d, slot.tIndex);
+  if (!cons.ok) return { ok:false, reason: cons.reason };
+
+  return { ok:true, reason:"ok" };
+}
+
+/***********************
+ * SCORE
+ ***********************/
+function CORE_scoreCandidate_(slot, dept, ctx) {
+  const { data, timeline, rules, remaining, scoringPolicy, CFG, colMap } = ctx;
+
+  const d = CORE_norm_(dept);
+  const t = timeline[slot.tIndex];
+  const rule = rules[d];
+
+  const desire = CORE_getDesire_(rule, t.shift, t.rowType);
+
+  let score = desire * CFG.W_DESIRE;
+  let parts = [`desire=${desire}`];
+
+  const hasME = (scoringPolicy.indexOf("ME") >= 0);
+  const hasQUOTA = (scoringPolicy.indexOf("QUOTA") >= 0);
+  const hasPRIORITY = (scoringPolicy.indexOf("PRIORITY") >= 0);
+
+  if (hasME && (t.shift === "M" || t.shift === "E")) {
+    const meVal = (t.rowType === "WEEKDAY") ? Number(rule.meWeekday || 0) : Number(rule.meWeekend || 0);
+    const mePotential = CORE_mePotential_(data, t.r, d, colMap);
+    if (meVal > 0 && mePotential) {
+      const meBonus = meVal * CFG.W_ME_BONUS;
+      score += meBonus;
+      parts.push(`ME=${meVal}*${CFG.W_ME_BONUS}`);
+    }
+  }
+
+  if (hasQUOTA) {
+    const fix   = Number(rule.fixShift || 0);
+    const baseQ = fix > 0 ? fix : Number(rule.ideal || 0);
+
+    const quotaBase = Math.max(1, baseQ);
+    const rem = Math.max(0, Number(remaining[d] || 0));
+
+    const quotaBonus = (rem / quotaBase) * CFG.W_QUOTA;
+    score += quotaBonus;
+    parts.push(`quota=${rem}/${quotaBase}*${CFG.W_QUOTA}`);
+  }
+
+  if (hasPRIORITY) {
+    const p = Math.max(0, Math.min(10, Number(rule.priority || 0)));
+    const prBonus = p * CFG.W_PRIORITY;
+    score += prBonus;
+    parts.push(`priority=${p}*${CFG.W_PRIORITY}`);
+  }
+
+  return { score, reason: parts.join(", ") };
+}
+
+/***********************
+ * UTIL: collect empty slots
+ ***********************/
+function CORE_collectEmptySlots_(timeline, acceptTypeFn, data, colMap) {
+  const slots = [];
+  for (let i = 0; i < timeline.length; i++) {
+    const t = timeline[i];
+    if (!acceptTypeFn(t.rowType)) continue;
+
+    for (const c of t.cols) {
+      if (!CORE_norm_(data[t.r][c])) {
+        slots.push({
+          r: t.r,
+          c,
+          shift: t.shift,
+          day: data[t.r][colMap.dayCol],
+          tIndex: i
+        });
+      }
+    }
+  }
+  return slots;
+}
+
+/***********************
+ * SLOT maker
+ ***********************/
+function CORE_makeSlot_(r, shift, c, tIndexMap, data, colMap) {
+  const key = r + "|" + shift;
+  const tIndex = (tIndexMap && tIndexMap[key] != null) ? tIndexMap[key] : -1;
+  const day = data[r][colMap.dayCol];
+  return { r, c, shift, day, tIndex };
+}
+
+/***********************
+ * Partner col picker
+ ***********************/
+function CORE_pickEmptyPartnerCol_(t, placedCol, data) {
+  for (const c of t.cols) {
+    if (c === placedCol) continue;
+    if (!CORE_norm_(data[t.r][c])) return c;
+  }
+  return null;
+}
+
+/***********************
+ * Partner picker
+ ***********************/
+function CORE_pickBestPartnerForSlot_(slot2, mustPairList, ctx) {
+  const { deptList, remaining } = ctx;
+
+  const cands = (mustPairList || [])
+    .map(CORE_norm_)
+    .filter(Boolean)
+    .filter(p => deptList.indexOf(p) >= 0)
+    .filter(p => (remaining[p] || 0) > 0)
+    .map(p => {
+      const check = CORE_checkCandidate_(slot2, p, ctx);
+      if (!check.ok) return null;
+      const scoreObj = CORE_scoreCandidate_(slot2, p, ctx);
+      return { dept:p, score: scoreObj.score, reason: scoreObj.reason };
+    })
+    .filter(Boolean)
+    .sort((x,y) => y.score - x.score);
+
+  return cands.length ? cands[0] : null;
+}
+
+/***********************
+ * EMP/mustPair feasibility
+ * ใช้ shallow check เพื่อกัน recursion ซ้อน
+ ***********************/
+function CORE_hasFeasiblePartnerForEmpMulti_(slot, dept, ctx) {
+  const { data, timeline, deptList, rules, remaining, tIndexMap, colMap } = ctx;
+
+  const d = CORE_norm_(dept);
+  const t = timeline[slot.tIndex];
+  const rule = rules[d];
+  if (!rule) return false;
+
+  const mp = (rule.mustPair && rule.mustPair.length) ? rule.mustPair : [];
+  if (!mp.length) return false;
+
+  const emptyPartnerCols = t.cols.filter(c => c !== slot.c && !CORE_norm_(data[t.r][c]));
+  if (!emptyPartnerCols.length) return false;
+
+  const inShift = t.cols.map(c => CORE_norm_(data[t.r][c])).filter(Boolean);
+  if (inShift.length > 0) return true;
+
+  for (const partnerCol of emptyPartnerCols) {
+    const slot2 = CORE_makeSlot_(t.r, t.shift, partnerCol, tIndexMap, data, colMap);
+
+    for (const p0 of mp) {
+      const p = CORE_norm_(p0);
+      if (!p) continue;
+      if (deptList.indexOf(p) < 0) continue;
+      if ((remaining[p] || 0) <= 0) continue;
+
+      const check = CORE_checkCandidateShallow_(slot2, p, ctx);
+      if (check.ok) return true;
+    }
+  }
+
+  return false;
+}
+
+/***********************
+ * PLACE
+ ***********************/
+function CORE_placeDept_(slot, dept, data) {
+  data[slot.r][slot.c] = CORE_norm_(dept);
+}
+
+/***********************
+ * QUOTA DONE
+ ***********************/
+function CORE_allQuotaDone_(remaining, deptList) {
+  return deptList.every(d => Number(remaining[d] || 0) <= 0);
+}
+
+/***********************
+ * DESIRE GETTER
+ ***********************/
+function CORE_getDesire_(rule, shiftKey, rowType) {
+  if (!rule || !rule.avail) return 0;
+
+  if (rowType === "WN_B4_WD" && shiftKey === "N") {
+    return Number(rule.avail.weekend.N_before_WD || 0);
+  }
+
+  const isWeekend = (rowType !== "WEEKDAY");
+  const side = isWeekend ? "weekend" : "weekday";
+  return Number((rule.avail[side] && rule.avail[side][shiftKey]) || 0);
+}
+
+/***********************
+ * ME potential
+ ***********************/
+function CORE_mePotential_(data, r, dept, colMap) {
+  const d = CORE_norm_(dept);
+
+  const mCols = colMap.shiftCols.M;
+  const eCols = colMap.shiftCols.E;
+
+  const mFilled = mCols.map(c => CORE_norm_(data[r][c])).filter(Boolean);
+  const eFilled = eCols.map(c => CORE_norm_(data[r][c])).filter(Boolean);
+
+  const mHas = mFilled.indexOf(d) >= 0;
+  const eHas = eFilled.indexOf(d) >= 0;
+
+  const mHasEmpty = (mFilled.length < mCols.length);
+  const eHasEmpty = (eFilled.length < eCols.length);
+
+  return (mHas && eHasEmpty) || (eHas && mHasEmpty) || (mHasEmpty && eHasEmpty);
+}
+
+/***********************
+ * CONSECUTIVE CHECK
+ ***********************/
+function CORE_checkNoMoreThan2Consecutive_(timeline, data, idx, dept, assumePlaceIdx) {
+  const d = CORE_norm_(dept);
+  let run = 1;
+
+  function hasDeptAt(tIndex) {
+    const t = timeline[tIndex];
+    const inShift = t.cols.map(c => CORE_norm_(data[t.r][c]));
+    if (inShift.indexOf(d) >= 0) return true;
+    return (tIndex === assumePlaceIdx);
+  }
+
+  for (let i = idx - 1; i >= 0; i--) {
+    if (hasDeptAt(i)) run++;
+    else break;
+  }
+  for (let i = idx + 1; i < timeline.length; i++) {
+    if (hasDeptAt(i)) run++;
+    else break;
+  }
+
+  if (run > 2) return { ok:false, reason:"ติดกันเกิน 2 เวร (run=" + run + ")" };
+  return { ok:true, reason:"" };
+}
+
+/***********************
+ * RULE READER
+ ***********************/
+function CORE_readRulesFromRuleSheet_(sh) {
+  const v = sh.getDataRange().getValues();
+  if (v.length < 2) throw new Error(sh.getName() + " ไม่มีข้อมูล");
+
+  const headers = v[0].map(x => String(x || "").trim());
+
+  const cDept = CORE_findCol_(headers, ["Department", "Dept", "แผนก"]);
+  const cMustPair = CORE_findCol_(headers, ["Must_Pair"]);
+  const cMustNot = CORE_findCol_(headers, ["Must_Not_Pair"]);
+
+  const cWeekdayM = CORE_findCol_(headers, ["Weekday_M"]);
+  const cWeekdayE = CORE_findCol_(headers, ["Weekday_E"]);
+  const cWeekdayN = CORE_findCol_(headers, ["Weekday_N"]);
+
+  const cWeekendM = CORE_findCol_(headers, ["Weekend_M"]);
+  const cWeekendE = CORE_findCol_(headers, ["Weekend_E"]);
+  const cWeekendN = CORE_findCol_(headers, ["Weekend_N"]);
+  const cWeekendNBefore = CORE_findCol_(headers, ["Weekend_N_before_WD"]);
+
+  const cWeekdayME = CORE_findCol_(headers, ["Weekday_ME"]);
+  const cWeekendME = CORE_findCol_(headers, ["Weekend_ME"]);
+
+  const cIdeal = CORE_findCol_(headers, ["Ideal_shift"]);
+  const cFix   = CORE_findCol_(headers, ["Fix_shift"]);
+  const cPrio  = CORE_findCol_(headers, ["Priority"]);
+
+  const mustHave = [
+    cDept,cMustPair,cMustNot,
+    cWeekdayM,cWeekdayE,cWeekdayN,
+    cWeekendM,cWeekendE,cWeekendN,cWeekendNBefore,
+    cWeekdayME,cWeekendME,
+    cIdeal
+  ];
+  if (mustHave.some(x => x === -1)) {
+    throw new Error("หัวคอลัมน์ใน " + sh.getName() + " ไม่ครบ/ชื่อไม่ตรง (ต้องมี Department, Must_Pair, Must_Not_Pair, คอลัมน์วัน/กะ, Weekday_ME, Weekend_ME, Ideal_shift)");
+  }
+
+  const rules = {};
+  for (let r = 1; r < v.length; r++) {
+    const dept = CORE_norm_(v[r][cDept]);
+    if (!dept) continue;
+
+    rules[dept] = {
+      dept,
+      mustPair: CORE_splitList_(v[r][cMustPair]).map(CORE_norm_).filter(Boolean),
+      mustNotPair: CORE_splitList_(v[r][cMustNot]).map(CORE_norm_).filter(Boolean),
+
+      avail: {
+        weekday: {
+          M: Number(v[r][cWeekdayM] || 0),
+          E: Number(v[r][cWeekdayE] || 0),
+          N: Number(v[r][cWeekdayN] || 0)
+        },
+        weekend: {
+          M: Number(v[r][cWeekendM] || 0),
+          E: Number(v[r][cWeekendE] || 0),
+          N: Number(v[r][cWeekendN] || 0),
+          N_before_WD: Number(v[r][cWeekendNBefore] || 0)
+        }
+      },
+
+      meWeekday: Number(v[r][cWeekdayME] || 0),
+      meWeekend: Number(v[r][cWeekendME] || 0),
+
+      ideal: Number(v[r][cIdeal] || 0),
+      fixShift: (cFix >= 0) ? Number(v[r][cFix] || 0) : 0,
+      priority: (cPrio >= 0) ? Number(v[r][cPrio] || 0) : 0
+    };
+  }
+
+  return rules;
+}
+
+/***********************
+ * CALENDAR MODE: BY_COLOR
+ ***********************/
+function CORE_detectWeekendColorFromColA_(colA_bg) {
+  for (let r = 1; r < colA_bg.length; r++) {
+    const c = CORE_normColor_(colA_bg[r][0]);
+    if (c && c !== "#ffffff" && c !== "white") return c;
+  }
+  return "#f6c6a5";
+}
+
+function CORE_buildSlotTypeByColor_(colA_bg, weekendColor) {
+  const type = [];
+  for (let r = 0; r < colA_bg.length; r++) {
+    const c = CORE_normColor_(colA_bg[r][0]);
+    const isWk = (c && c !== "#ffffff" && c !== "white" && c === weekendColor);
+    type[r] = isWk ? "WEEKEND" : "WEEKDAY";
+  }
+  for (let r = 0; r < type.length; r++) {
+    const todayWk = (type[r] === "WEEKEND");
+    const tomWk   = (r + 1 < type.length) ? (type[r + 1] === "WEEKEND") : false;
+    if (todayWk && !tomWk) type[r] = "WN_B4_WD";
+  }
+  return type;
+}
+
+/***********************
+ * CALENDAR MODE: BY_DATE
+ ***********************/
+function CORE_loadHolidaySet_(holidaySh) {
+  const lastRow = holidaySh.getLastRow();
+  if (lastRow < 1) return new Set();
+  const vals = holidaySh.getRange(1,1,lastRow,1).getValues();
+  const set = new Set();
+  for (let i = 0; i < vals.length; i++) {
+    const v = vals[i][0];
+    if (v instanceof Date) set.add(CORE_toISODateKey_(v));
+  }
+  return set;
+}
+
+function CORE_buildSlotTypeByDate_(data, monthCell, holidaySet, dayCol) {
+  const year = monthCell.getFullYear();
+  const month = monthCell.getMonth();
+
+  function isWeekend_(dt) {
+    const d = dt.getDay();
+    return d === 0 || d === 6;
+  }
+
+  const type = [];
+  for (let r = 0; r < data.length; r++) {
+    if (r === 0) { type[r] = "WEEKDAY"; continue; }
+    const dayNum = Number(data[r][dayCol] || 0);
+    if (!dayNum) { type[r] = "WEEKDAY"; continue; }
+
+    const dt = new Date(year, month, dayNum);
+    const key = CORE_toISODateKey_(dt);
+    const isWk = isWeekend_(dt) || holidaySet.has(key);
+    type[r] = isWk ? "WEEKEND" : "WEEKDAY";
+  }
+
+  for (let r = 1; r < data.length; r++) {
+    const dayNum = Number(data[r][dayCol] || 0);
+    if (!dayNum) continue;
+
+    const dt = new Date(year, month, dayNum);
+    const key = CORE_toISODateKey_(dt);
+    const todayWk = (isWeekend_(dt) || holidaySet.has(key));
+
+    const next = new Date(year, month, dayNum + 1);
+    const nextKey = CORE_toISODateKey_(next);
+    const tomWk = (isWeekend_(next) || holidaySet.has(nextKey));
+
+    if (todayWk && !tomWk) type[r] = "WN_B4_WD";
+  }
+
+  return type;
+}
+
+/***********************
+ * LOG WRITER
+ ***********************/
+function CORE_writeLog_(ss, sheetName, rows) {
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) sh = ss.insertSheet(sheetName);
+  sh.clear();
+  if (!rows || !rows.length) return;
+  sh.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+  sh.autoResizeColumns(1, rows[0].length);
+}
+
+/***********************
+ * RESULT HEADER MAP
+ ***********************/
+function CORE_normHeader_(v) {
+  return String(v || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "")
+    .replace(/_/g, "");
+}
+
+function CORE_findColByNames_(headers, names) {
+  const H = headers.map(CORE_normHeader_);
+  const targets = (names || []).map(CORE_normHeader_);
+  for (let i = 0; i < H.length; i++) {
+    for (const t of targets) {
+      if (H[i] === t) return i;
+    }
+  }
+  return -1;
+}
+
+function CORE_getResultColMap_Flex_(headerRow) {
+  const headers = (headerRow || []).map(x => String(x || "").trim());
+
+  const cDay = CORE_findColByNames_(headers, ["DAY", "วัน", "DATE"]);
+  if (cDay < 0) {
+    throw new Error("Result ต้องมีคอลัมน์ DAY หรือ วัน");
+  }
+
+  const shiftCols = { M: [], E: [], N: [] };
+
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i].toUpperCase().replace(/\s+/g, "");
+    if (/^M\d+$/.test(h)) shiftCols.M.push(i);
+    if (/^E\d+$/.test(h)) shiftCols.E.push(i);
+    if (/^N\d+$/.test(h)) shiftCols.N.push(i);
+  }
+
+  if (!shiftCols.M.length || !shiftCols.E.length || !shiftCols.N.length) {
+    throw new Error("Result ต้องมีอย่างน้อย M1, E1, N1 (สามารถเพิ่ม M2,M3,... ได้อิสระ)");
+  }
+
+  const maxColIndex = Math.max(
+    cDay,
+    ...shiftCols.M,
+    ...shiftCols.E,
+    ...shiftCols.N
+  );
+
+  return { dayCol: cDay, shiftCols, maxColIndex };
+}
+
+/***********************
+ * GET DEPT LIST
+ ***********************/
+function CORE_getDeptList_FromRuleSheet_(sh) {
+  const v = sh.getDataRange().getValues();
+  if (v.length < 2) return [];
+  const headers = v[0].map(x => String(x || "").trim());
+  const cDept = CORE_findCol_(headers, ["Department", "Dept", "แผนก"]);
+  const deptCol = (cDept >= 0) ? cDept : 0;
+
+  const set = new Set();
+  for (let r = 1; r < v.length; r++) {
+    const d = CORE_norm_(v[r][deptCol]);
+    if (d) set.add(d);
+  }
+  return Array.from(set).sort();
+}
+
+/***********************
+ * BASIC UTILS
+ ***********************/
+function CORE_now_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+}
+
+function CORE_cellA1_(r0, c0) {
+  return CORE_toA1_(r0 + 1, c0 + 1);
+}
+
+function CORE_toA1_(row, col) {
+  let s = "";
+  let n = col;
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s + row;
+}
+
+function CORE_findCol_(headers, keys) {
+  const lower = headers.map(h => String(h || "").toLowerCase());
+  for (let i = 0; i < lower.length; i++) {
+    for (const k of keys) {
+      const kk = String(k).toLowerCase();
+      if (lower[i] === kk) return i;
+      if (lower[i].indexOf(kk) >= 0) return i;
+    }
+  }
+  return -1;
+}
+
+function CORE_splitList_(v) {
+  const s = String(v || "").trim();
+  if (!s) return [];
+  return s.split(/[\s,]+/).map(x => String(x || "").trim()).filter(Boolean);
+}
+
+function CORE_norm_(v) {
+  return String(v || "").trim().toUpperCase();
+}
+
+function CORE_normColor_(c) {
+  if (!c) return "";
+  return String(c).trim().toLowerCase();
+}
+
+function CORE_toISODateKey_(date) {
+  return date.getFullYear() + "-" + CORE_pad2_(date.getMonth() + 1) + "-" + CORE_pad2_(date.getDate());
+}
+
+function CORE_pad2_(n) {
+  n = String(n);
+  return n.length === 1 ? ("0" + n) : n;
+}
+
+/***********************
+ * คอลัมน์ A เป็น text หรือไม่
+ ***********************/
+function CORE_isTextInColA_(v) {
+  if (v == null) return false;
+  if (v instanceof Date) return false;
+
+  const s = String(v).trim();
+  if (!s) return false;
+
+  return !/^\d+$/.test(s);
+}
