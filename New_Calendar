@@ -1,0 +1,400 @@
+/*******************************
+ * CONFIG
+ *******************************/
+var SHEET_CONDITION = "IN_D";     // A = ชื่อคน, B = token เช่น "1M 2E 15N"
+var SHEET_HOLIDAY   = "holiday";   // คอลัมน์ A เป็น Date (วันหยุดราชการ)
+var SHEET_RESULT_IN = "Result_IN"; // ชีทผลลัพธ์ (กำหนดตายตัว)
+
+/*******************************
+ * MAIN (DEMAND ONLY + PROMPT CAPACITY)
+ * - ถาม 2 อย่าง:
+ *   1) เดือน (2026-01 หรือ 01/2026)
+ *   2) จำนวนคนต่อเวร (M,E,N) เช่น 2,2,2
+ * - สร้างชีท Result_IN แบบคอลัมน์ยืดหยุ่น: Day | N1.. | M1.. | E1..
+ * - ไฮไลท์ เสาร์-อาทิตย์ + วันหยุดราชการจากชีท holiday
+ * - ลงชื่อคนจาก IN_D เฉพาะ token ในคอลัมน์ B
+ *******************************/
+function runSchedule_DemandOnly_IN() {
+  var ss = SpreadsheetApp.getActive();
+  var ui = SpreadsheetApp.getUi();
+
+  // ✅ เลือกชีทเงื่อนไข (ต้นทาง)
+  var conditionSheetName = pickConditionSheet_(ss, ui, SHEET_CONDITION);
+  if (!conditionSheetName) return;
+
+  // ✅ เลือกชีทผลลัพธ์ (ปลายทาง)
+  var resultSheetName = pickResultSheet_(ss, ui, SHEET_RESULT_IN);
+  if (!resultSheetName) return;
+
+  var conditionSh = ss.getSheetByName(conditionSheetName);
+  var holidaySh   = ss.getSheetByName(SHEET_HOLIDAY);
+
+  if (!conditionSh) throw new Error('ไม่พบชีท "' + conditionSheetName + '"');
+  if (!holidaySh)   throw new Error('ไม่พบชีท "' + SHEET_HOLIDAY + '"');
+
+  // 1) Prompt month
+  var res = ui.prompt(
+    "จัดตารางเวร (Demand จากคอลัมน์ B เท่านั้น)",
+    "กรอกเดือนที่ต้องการจัดเวร\nตัวอย่าง: 2026-01 หรือ 01/2026",
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+
+  var monthInput = (res.getResponseText() || "").trim();
+  var monthInfo = parseMonthInput_(monthInput);
+  if (!monthInfo) {
+    ui.alert("รูปแบบเดือนไม่ถูกต้อง\nกรุณากรอกเป็น 2026-01 หรือ 01/2026");
+    return;
+  }
+
+  var year = monthInfo.year;
+  var monthIndex = monthInfo.monthIndex; // 0-11
+  var lastDay = monthInfo.lastDay;
+
+  // 2) Prompt capacities per shift (M,E,N)
+  var caps = promptShiftCapacities_(ui);
+  if (!caps) {
+    ui.alert("รูปแบบจำนวนคนต่อเวรไม่ถูกต้อง\nกรุณากรอกแบบ M,E,N เช่น 2,2,2 หรือ 3,2,4");
+    return;
+  }
+
+  // Load holidays
+  var holidaySet = loadHolidaySet_(holidaySh);
+
+  // ✅ Build result sheet in the selected destination sheet
+  var resultSh = buildResultSheet_(ss, resultSheetName, year, monthIndex, lastDay, holidaySet, caps);
+
+  // Load people rules from selected condition sheet
+  var peopleRules = loadPeopleRules_DemandOnly_(conditionSh);
+
+  // Build demand map from col B
+  var demandMap = buildDemandMapFromPeopleRules_(peopleRules, year, monthIndex);
+
+  // Fill Result with demand ONLY
+  var stats = fillResult_DemandOnly_({
+    resultSh: resultSh,
+    year: year,
+    monthIndex: monthIndex,
+    lastDay: lastDay,
+    demandMap: demandMap,
+    caps: caps
+  });
+
+  var statusMsg = (stats.overflow !== 0)
+    ? "❌ การลงเวรไม่สำเร็จ (มีตกค้างเกินจำนวนคนต่อเวร)"
+    : "✅ การลงเวรสำเร็จ";
+
+  ui.alert(
+    "เสร็จแล้ว: " + year + "-" + pad2_(monthIndex + 1) +
+    "\n- ชีทต้นทางที่ใช้: " + conditionSheetName +
+    "\n- ชีทปลายทางที่ลงผล: " + resultSheetName +
+    "\n- ลงจากคอลัมน์ B ได้: " + stats.filled +
+    "\n- ตกค้างเกินจำนวนคนต่อเวร: " + stats.overflow +
+    "\n\n" + statusMsg
+  );
+}
+
+function pickConditionSheet_(ss, ui, defaultName) {
+  var names = ss.getSheets().map(function(s){ return s.getName(); });
+  var msg =
+    "เลือกชีทเงื่อนไข (A=ชื่อคน, B=token)\n" +
+    "พิมพ์ชื่อชีทให้ตรงตามนี้:\n- " + names.join("\n- ") +
+    "\n\n(ถ้าปล่อยว่าง จะใช้ค่าเริ่มต้น: " + defaultName + ")";
+
+  var res = ui.prompt("เลือกชีทเงื่อนไข", msg, ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return null;
+
+  var input = (res.getResponseText() || "").trim();
+  var chosen = input ? input : defaultName;
+
+  if (names.indexOf(chosen) < 0) {
+    ui.alert('ไม่พบชีท "' + chosen + '"');
+    return null;
+  }
+  return chosen;
+}
+function pickResultSheet_(ss, ui, defaultName) {
+  var names = ss.getSheets().map(function(s){ return s.getName(); });
+  var msg =
+    "เลือกชีทผลลัพธ์ (ที่จะเอาข้อมูลไปลง)\n" +
+    "พิมพ์ชื่อชีทให้ตรงตามนี้:\n- " + names.join("\n- ") +
+    "\n\n(ถ้าปล่อยว่าง จะใช้ค่าเริ่มต้น: " + defaultName + ")";
+
+  var res = ui.prompt("เลือกชีทผลลัพธ์", msg, ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return null;
+
+  var input = (res.getResponseText() || "").trim();
+  var chosen = input ? input : defaultName;
+
+  // ถ้าไม่มีชีทนี้ ให้สร้างให้เลย (กันพลาด)
+  var sh = ss.getSheetByName(chosen);
+  if (!sh) {
+    sh = ss.insertSheet(chosen);
+  }
+  return chosen;
+}
+
+/*******************************
+ * PROMPT: SHIFT CAPACITIES
+ * รูปแบบ: M,E,N เช่น 2,2,2
+ *******************************/
+function promptShiftCapacities_(ui) {
+  var res = ui.prompt(
+    "จำนวนคนต่อเวร",
+    "กรอกจำนวนคนต่อเวร (แยกด้วยเครื่องหมาย , )\nรูปแบบ: M,E,N\nตัวอย่าง: 2,2,2 หรือ 3,2,4",
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (res.getSelectedButton() !== ui.Button.OK) return null;
+
+  var raw = (res.getResponseText() || "").trim();
+  var parts = raw.split(",").map(function(x){ return x.trim(); });
+
+  if (parts.length !== 3) return null;
+
+  var m = Number(parts[0]);
+  var e = Number(parts[1]);
+  var n = Number(parts[2]);
+
+  // จำกัดเพื่อกันคอลัมน์บาน (ปรับได้)
+  if (![m,e,n].every(function(v){ return Number.isFinite(v) && v >= 1 && v <= 20; })) return null;
+
+  return { M: Math.floor(m), E: Math.floor(e), N: Math.floor(n) };
+}
+
+/*******************************
+ * RESULT SHEET TEMPLATE (DYNAMIC)
+ * คอลัมน์: Day | N1..Nn | M1..Mm | E1..Ee
+ *******************************/
+function buildResultSheet_(ss, resultSheetName, year, monthIndex, lastDay, holidaySet, caps) {
+  var sh = ss.getSheetByName(resultSheetName);
+  if (!sh) sh = ss.insertSheet(resultSheetName);
+  sh.clear();
+
+  // headers dynamic
+  var headers = ["Day"];
+  for (var i = 1; i <= caps.N; i++) headers.push("N" + i);
+  for (var j = 1; j <= caps.M; j++) headers.push("M" + j);
+  for (var k = 1; k <= caps.E; k++) headers.push("E" + k);
+
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold");
+  sh.setFrozenRows(1);
+
+  // days
+  var days = [];
+  for (var d = 1; d <= lastDay; d++) days.push([d]);
+  sh.getRange(2, 1, lastDay, 1).setValues(days);
+
+  // borders + widths
+  sh.getRange(1, 1, lastDay + 1, headers.length).setBorder(true, true, true, true, true, true);
+  sh.setColumnWidth(1, 55);
+  for (var c = 2; c <= headers.length; c++) sh.setColumnWidth(c, 85);
+
+  // label month -> A34 B34
+  sh.getRange("A34").setValue("เดือนที่จัด");
+  sh.getRange("B34").setValue(new Date(year, monthIndex, 1)).setNumberFormat("yyyy-mm");
+
+  // highlight holidays/weekends across all columns
+  applyHolidayHighlight_(sh, year, monthIndex, lastDay, holidaySet, headers.length);
+
+  return sh;
+}
+
+
+function applyHolidayHighlight_(sh, year, monthIndex, lastDay, holidaySet, numCols) {
+  var bg = [];
+  for (var d = 1; d <= lastDay; d++) {
+    var date = new Date(year, monthIndex, d);
+    var key = toISODateKey_(date);
+    var isWk = isWeekend_(date) || holidaySet.has(key);
+    var color = isWk ? "#f6c6a5" : null;
+
+    var row = [];
+    for (var i = 0; i < numCols; i++) row.push(color);
+    bg.push(row);
+  }
+  sh.getRange(2, 1, lastDay, numCols).setBackgrounds(bg);
+}
+
+/*******************************
+ * LOAD: HOLIDAY
+ * - อ่านคอลัมน์ A ทั้งหมด
+ * - เก็บเฉพาะ cell ที่เป็น Date
+ *******************************/
+function loadHolidaySet_(holidaySh) {
+  var lastRow = holidaySh.getLastRow();
+  if (lastRow < 1) return new Set();
+
+  var vals = holidaySh.getRange(1, 1, lastRow, 1).getValues();
+  var set = new Set();
+  for (var i = 0; i < vals.length; i++) {
+    var v = vals[i][0];
+    if (v instanceof Date) set.add(toISODateKey_(v));
+  }
+  return set;
+}
+
+/*******************************
+ * LOAD: IN_D (PEOPLE DEMAND ONLY)
+ * Expect:
+ * A = Name (รายชื่อบุคคล)
+ * B = Demand tokens like "1M 1M 2E"
+ *******************************/
+function loadPeopleRules_DemandOnly_(conditionSh) {
+  var lastRow = conditionSh.getLastRow();
+  if (lastRow < 2) return {};
+
+  // อ่านแค่คอลัมน์ A..B
+  var data = conditionSh.getRange(2, 1, lastRow - 1, 2).getValues();
+
+  var rules = {};
+  for (var r = 0; r < data.length; r++) {
+    var name = String(data[r][0] || "").trim();
+    if (!name) continue;
+
+    var demandStr = String(data[r][1] || "").trim();
+    rules[name] = {
+      name: name,
+      demandTokens: tokenize_(demandStr)
+    };
+  }
+  return rules;
+}
+
+/*******************************
+ * BUILD DEMAND MAP from People rules
+ * demandMap["YYYY-MM-DD|M"] = ["สมชาย","สุดา",...]
+ *******************************/
+function buildDemandMapFromPeopleRules_(peopleRules, year, monthIndex) {
+  var demandMap = {};
+  var names = Object.keys(peopleRules);
+
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var rule = peopleRules[name];
+    var toks = rule.demandTokens || [];
+
+    for (var t = 0; t < toks.length; t++) {
+      var parsed = parseDayShiftToken_(toks[t]);
+      if (!parsed) continue;
+
+      var date = new Date(year, monthIndex, parsed.day);
+      var slotKey = toISODateKey_(date) + "|" + parsed.shift;
+
+      if (!demandMap[slotKey]) demandMap[slotKey] = [];
+      demandMap[slotKey].push(name);
+    }
+  }
+  return demandMap;
+}
+
+/*******************************
+ * FILL RESULT (DEMAND ONLY, DYNAMIC CAP)
+ * คอลัมน์: Day | N... | M... | E...
+ * - แต่ละเวรรับ cap คน
+ * - ถ้าเกิน cap -> overflow
+ *******************************/
+function fillResult_DemandOnly_(ctx) {
+  var resultSh   = ctx.resultSh;
+  var year       = ctx.year;
+  var monthIndex = ctx.monthIndex;
+  var lastDay    = ctx.lastDay;
+  var demandMap  = ctx.demandMap;
+  var caps       = ctx.caps; // {M,E,N}
+
+  // start columns based on dynamic headers
+  // A: Day
+  var startColN = 2;
+  var startColM = startColN + caps.N;
+  var startColE = startColM + caps.M;
+
+  var filled = 0;
+  var overflow = 0;
+
+  for (var day = 1; day <= lastDay; day++) {
+    var row = day + 1;
+    var date = new Date(year, monthIndex, day);
+
+    overflow += fillOneShift_(resultSh, row, date, "N", startColN, caps.N, demandMap, function(){ filled++; });
+    overflow += fillOneShift_(resultSh, row, date, "M", startColM, caps.M, demandMap, function(){ filled++; });
+    overflow += fillOneShift_(resultSh, row, date, "E", startColE, caps.E, demandMap, function(){ filled++; });
+  }
+
+  return { filled: filled, overflow: overflow };
+}
+
+function fillOneShift_(sh, row, date, shift, startCol, cap, demandMap, onFilled) {
+  var slotKey = toISODateKey_(date) + "|" + shift;
+  var req = demandMap[slotKey] ? demandMap[slotKey].slice() : [];
+
+  for (var i = 0; i < cap; i++) {
+    var v = req.length > 0 ? req.shift() : "";
+    sh.getRange(row, startCol + i).setValue(v);
+    if (v) onFilled();
+  }
+
+  return req.length; // leftover = overflow
+}
+
+/*******************************
+ * HELPERS (date/parse)
+ *******************************/
+function parseMonthInput_(s) {
+  var m;
+
+  // YYYY-MM
+  if ((m = s.match(/^(\d{4})-(\d{1,2})$/))) {
+    var year = Number(m[1]);
+    var month = Number(m[2]);
+    if (month < 1 || month > 12) return null;
+    var mi = month - 1;
+    var last = new Date(year, mi + 1, 0).getDate();
+    return { year: year, monthIndex: mi, lastDay: last };
+  }
+
+  // MM/YYYY
+  if ((m = s.match(/^(\d{1,2})\/(\d{4})$/))) {
+    var month2 = Number(m[1]);
+    var year2 = Number(m[2]);
+    if (month2 < 1 || month2 > 12) return null;
+    var mi2 = month2 - 1;
+    var last2 = new Date(year2, mi2 + 1, 0).getDate();
+    return { year: year2, monthIndex: mi2, lastDay: last2 };
+  }
+
+  return null;
+}
+
+function tokenize_(s) {
+  if (!s) return [];
+  return String(s)
+    .split(/\s+/)
+    .map(function(x){ return x.trim(); })
+    .filter(function(x){ return !!x; });
+}
+
+// token: 1M / 2E / 15N
+function parseDayShiftToken_(tok) {
+  var m = String(tok).match(/^(\d{1,2})([MEN])$/i);
+  if (!m) return null;
+  var day = Number(m[1]);
+  var shift = String(m[2]).toUpperCase();
+  if (day < 1 || day > 31) return null;
+  return { day: day, shift: shift };
+}
+
+function isWeekend_(date) {
+  var d = date.getDay();
+  return d === 0 || d === 6;
+}
+
+function toISODateKey_(date) {
+  var y = date.getFullYear();
+  var m = pad2_(date.getMonth() + 1);
+  var d = pad2_(date.getDate());
+  return y + "-" + m + "-" + d;
+}
+
+function pad2_(n) {
+  n = String(n);
+  return n.length === 1 ? "0" + n : n;
+}
